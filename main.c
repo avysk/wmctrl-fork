@@ -28,12 +28,101 @@ Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 #include <X11/Xlib.h>
 #include <X11/Xmu/WinUtil.h>
 #include <X11/cursorfont.h>
-#include <glib.h>
+#define _GNU_SOURCE
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <iconv.h>
+#include <langinfo.h>
+#include <utf8proc.h>
+#include <ctype.h>
+#include <stdarg.h>
+#include <stdint.h>
+
+static char *my_strdup_printf(const char *fmt, ...) {
+    char *str = NULL;
+    va_list args;
+    va_start(args, fmt);
+    if (vasprintf(&str, fmt, args) == -1) {
+        str = NULL;
+    }
+    va_end(args);
+    return str;
+}
+
+static char *my_ascii_strup(const char *str, int len) {
+    if (!str) return NULL;
+    int l = (len < 0) ? strlen(str) : len;
+    char *res = malloc(l + 1);
+    if (!res) return NULL;
+    for (int i = 0; i < l; i++) {
+        res[i] = toupper((unsigned char)str[i]);
+    }
+    res[l] = '\0';
+    return res;
+}
+
+static char *my_utf8_casefold(const char *str, int len) {
+    if (!str) return NULL;
+    uint8_t *dest = NULL;
+    utf8proc_map((const uint8_t *)str, 0, &dest, UTF8PROC_CASEFOLD | UTF8PROC_NULLTERM);
+    return (char *)dest;
+}
+
+static char *my_iconv_convert(const char *tocode, const char *fromcode, const char *str) {
+    if (!str) return NULL;
+    iconv_t cd = iconv_open(tocode, fromcode);
+    if (cd == (iconv_t)-1) return NULL;
+    
+    size_t inbytesleft = strlen(str);
+    size_t outbytesleft = inbytesleft * 4 + 1;
+    char *outbuf = malloc(outbytesleft);
+    if (!outbuf) {
+        iconv_close(cd);
+        return NULL;
+    }
+    
+    char *inbuf = (char *)str;
+    char *outptr = outbuf;
+    
+    size_t res = iconv(cd, &inbuf, &inbytesleft, &outptr, &outbytesleft);
+    iconv_close(cd);
+    
+    if (res == (size_t)-1) {
+        free(outbuf);
+        return NULL;
+    }
+    
+    *outptr = '\0';
+    return outbuf;
+}
+
+static char *my_locale_to_utf8(const char *str) {
+    return my_iconv_convert("UTF-8", nl_langinfo(CODESET), str);
+}
+
+static char *my_locale_from_utf8(const char *str) {
+    return my_iconv_convert(nl_langinfo(CODESET), "UTF-8", str);
+}
+
+static bool my_get_charset(const char **charset) {
+    *charset = nl_langinfo(CODESET);
+    return strcmp(*charset, "UTF-8") == 0;
+}
+
+static void my_strfreev(char **str_array) {
+    if (str_array) {
+        for (int i = 0; str_array[i] != NULL; i++) {
+            free(str_array[i]);
+        }
+        free(str_array);
+    }
+}
+
+
 
 #define _NET_WM_STATE_REMOVE 0 /* remove/unset property */
 #define _NET_WM_STATE_ADD 1    /* add/set property */
@@ -214,7 +303,7 @@ Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
   }
 
 /* declarations of static functions */ /*{{{*/
-static gboolean wm_supports(Display *disp, const gchar *prop);
+static bool wm_supports(Display *disp, const char *prop);
 static Window *get_client_list(Display *disp, unsigned long *size);
 static int client_msg(Display *disp, Window win, char *msg, unsigned long data0,
                       unsigned long data1, unsigned long data2,
@@ -227,20 +316,20 @@ static int change_geometry(Display *disp);
 static int change_number_of_desktops(Display *disp);
 static int switch_desktop(Display *disp);
 static int wm_info(Display *disp);
-static gchar *get_output_str(gchar *str, gboolean is_utf8);
+static char *get_output_str(char *str, bool is_utf8);
 static int action_window(Display *disp, Window win, char mode);
 static int action_window_pid(Display *disp, char mode);
 static int action_window_str(Display *disp, char mode);
-static int activate_window(Display *disp, Window win, gboolean switch_desktop);
+static int activate_window(Display *disp, Window win, bool switch_desktop);
 static int close_window(Display *disp, Window win);
-static int longest_str(gchar **strv);
+static int longest_str(char **strv);
 static int window_to_desktop(Display *disp, Window win, int desktop);
 static void window_set_title(Display *disp, Window win, const char *str,
                              char mode);
-static gchar *get_window_title(Display *disp, Window win);
-static gchar *get_window_class(Display *disp, Window win);
-static gchar *get_property(Display *disp, Window win, Atom xa_prop_type,
-                           gchar *prop_name, unsigned long *size);
+static char *get_window_title(Display *disp, Window win);
+static char *get_window_class(Display *disp, Window win);
+static char *get_property(Display *disp, Window win, Atom xa_prop_type,
+                           char *prop_name, unsigned long *size);
 static void init_charset(void);
 static int window_move_resize(Display *disp, Window win, const char *arg);
 static int window_state(Display *disp, Window win, const char *arg);
@@ -263,7 +352,7 @@ static struct {
   char *param;
 } options;
 
-static gboolean envir_utf8;
+static bool envir_utf8;
 
 int main(int argc, char **argv) { /* {{{ */
   int opt;
@@ -274,7 +363,7 @@ int main(int argc, char **argv) { /* {{{ */
 
   memset(&options, 0, sizeof(options)); /* just for sure */
 
-  /* necessary to make g_get_charset() and g_locale_*() work */
+  /* necessary to make my_get_charset() and g_locale_*() work */
   setlocale(LC_ALL, "");
 
   /* make "--help" and "--version" work. I don't want to use
@@ -429,26 +518,26 @@ int main(int argc, char **argv) { /* {{{ */
 /* }}} */
 
 static void init_charset(void) { /*{{{*/
-  const gchar *charset;          /* unused */
-  gchar *lang = getenv("LANG") ? g_ascii_strup(getenv("LANG"), -1) : NULL;
-  gchar *lc_ctype =
-      getenv("LC_CTYPE") ? g_ascii_strup(getenv("LC_CTYPE"), -1) : NULL;
+  const char *charset;          /* unused */
+  char *lang = getenv("LANG") ? my_ascii_strup(getenv("LANG"), -1) : NULL;
+  char *lc_ctype =
+      getenv("LC_CTYPE") ? my_ascii_strup(getenv("LC_CTYPE"), -1) : NULL;
 
   /* this glib function doesn't work on my system ... */
-  envir_utf8 = g_get_charset(&charset);
+  envir_utf8 = my_get_charset(&charset);
 
   /* ... therefore we will examine the environment variables */
   if (lc_ctype && (strstr(lc_ctype, "UTF8") || strstr(lc_ctype, "UTF-8"))) {
-    envir_utf8 = TRUE;
+    envir_utf8 = true;
   } else if (lang && (strstr(lang, "UTF8") || strstr(lang, "UTF-8"))) {
-    envir_utf8 = TRUE;
+    envir_utf8 = true;
   }
 
-  g_free(lang);
-  g_free(lc_ctype);
+  free(lang);
+  free(lc_ctype);
 
   if (options.force_utf8) {
-    envir_utf8 = TRUE;
+    envir_utf8 = true;
   }
   p_verbose("envir_utf8: %d\n", envir_utf8);
 } /*}}}*/
@@ -480,8 +569,8 @@ static int client_msg(Display *disp, Window win, char *msg, /* {{{ */
   }
 } /*}}}*/
 
-static gchar *get_output_str(gchar *str, gboolean is_utf8) { /*{{{*/
-  gchar *out;
+static char *get_output_str(char *str, bool is_utf8) { /*{{{*/
+  char *out;
 
   if (str == NULL) {
     return NULL;
@@ -489,21 +578,21 @@ static gchar *get_output_str(gchar *str, gboolean is_utf8) { /*{{{*/
 
   if (envir_utf8) {
     if (is_utf8) {
-      out = g_strdup(str);
+      out = strdup(str);
     } else {
-      if (!(out = g_locale_to_utf8(str, -1, NULL, NULL, NULL))) {
+      if (!(out = my_locale_to_utf8(str))) {
         p_verbose("Cannot convert string from locale charset to UTF-8.\n");
-        out = g_strdup(str);
+        out = strdup(str);
       }
     }
   } else {
     if (is_utf8) {
-      if (!(out = g_locale_from_utf8(str, -1, NULL, NULL, NULL))) {
+      if (!(out = my_locale_from_utf8(str))) {
         p_verbose("Cannot convert string from UTF-8 to locale charset.\n");
-        out = g_strdup(str);
+        out = strdup(str);
       }
     } else {
-      out = g_strdup(str);
+      out = strdup(str);
     }
   }
 
@@ -512,13 +601,13 @@ static gchar *get_output_str(gchar *str, gboolean is_utf8) { /*{{{*/
 
 static int wm_info(Display *disp) { /*{{{*/
   Window *sup_window = NULL;
-  gchar *wm_name = NULL;
-  gchar *wm_class = NULL;
+  char *wm_name = NULL;
+  char *wm_class = NULL;
   unsigned long *wm_pid = NULL;
   unsigned long *showing_desktop = NULL;
-  gboolean name_is_utf8 = TRUE;
-  gchar *name_out;
-  gchar *class_out;
+  bool name_is_utf8 = true;
+  char *name_out;
+  char *class_out;
 
   if (!(sup_window =
             (Window *)get_property(disp, DefaultRootWindow(disp), XA_WINDOW,
@@ -537,7 +626,7 @@ static int wm_info(Display *disp) { /*{{{*/
   if (!(wm_name = get_property(disp, *sup_window,
                                XInternAtom(disp, "UTF8_STRING", False),
                                "_NET_WM_NAME", NULL))) {
-    name_is_utf8 = FALSE;
+    name_is_utf8 = false;
     if (!(wm_name = get_property(disp, *sup_window, XA_STRING, "_NET_WM_NAME",
                                  NULL))) {
       p_verbose("Cannot get name of the window manager (_NET_WM_NAME).\n");
@@ -549,7 +638,7 @@ static int wm_info(Display *disp) { /*{{{*/
   if (!(wm_class = get_property(disp, *sup_window,
                                 XInternAtom(disp, "UTF8_STRING", False),
                                 "WM_CLASS", NULL))) {
-    name_is_utf8 = FALSE;
+    name_is_utf8 = false;
     if (!(wm_class =
               get_property(disp, *sup_window, XA_STRING, "WM_CLASS", NULL))) {
       p_verbose("Cannot get class of the window manager (WM_CLASS).\n");
@@ -587,12 +676,12 @@ static int wm_info(Display *disp) { /*{{{*/
     printf("Window manager's \"showing the desktop\" mode: N/A\n");
   }
 
-  g_free(name_out);
-  g_free(sup_window);
-  g_free(wm_name);
-  g_free(wm_class);
-  g_free(wm_pid);
-  g_free(showing_desktop);
+  free(name_out);
+  free(sup_window);
+  free(wm_name);
+  free(wm_class);
+  free(wm_pid);
+  free(showing_desktop);
 
   return EXIT_SUCCESS;
 } /*}}}*/
@@ -673,13 +762,13 @@ static void window_set_title(Display *disp, Window win, /* {{{ */
   void *title_local;
 
   if (envir_utf8) {
-    title_utf8 = g_strdup(title);
+    title_utf8 = strdup(title);
     title_local = NULL;
   } else {
-    if (!(title_utf8 = g_locale_to_utf8(title, -1, NULL, NULL, NULL))) {
-      title_utf8 = g_strdup(title);
+    if (!(title_utf8 = my_locale_to_utf8(title))) {
+      title_utf8 = strdup(title);
     }
-    title_local = g_strdup(title);
+    title_local = strdup(title);
   }
 
   if (mode == 'T' || mode == 'N') {
@@ -708,8 +797,8 @@ static void window_set_title(Display *disp, Window win, /* {{{ */
                     title_utf8, strlen(title_utf8));
   }
 
-  g_free(title_utf8);
-  g_free(title_local);
+  free(title_utf8);
+  free(title_local);
 
 } /*}}}*/
 
@@ -731,14 +820,14 @@ static int window_to_desktop(Display *disp, Window win, int desktop) { /*{{{*/
     }
     desktop = *cur_desktop;
   }
-  g_free(cur_desktop);
+  free(cur_desktop);
 
   return client_msg(disp, win, "_NET_WM_DESKTOP", (unsigned long)desktop, 0, 0,
                     0, 0);
 } /*}}}*/
 
 static int activate_window(Display *disp, Window win, /* {{{ */
-                           gboolean switch_desktop) {
+                           bool switch_desktop) {
   unsigned long *desktop;
 
   /* desktop ID */
@@ -755,7 +844,7 @@ static int activate_window(Display *disp, Window win, /* {{{ */
                    *desktop, 0, 0, 0, 0) != EXIT_SUCCESS) {
       p_verbose("Cannot switch desktop.\n");
     }
-    g_free(desktop);
+    free(desktop);
   }
 
   client_msg(disp, win, "_NET_ACTIVE_WINDOW", 0, 0, 0, 0, 0);
@@ -768,7 +857,7 @@ static int close_window(Display *disp, Window win) { /*{{{*/
   return client_msg(disp, win, "_NET_CLOSE_WINDOW", 0, 0, 0, 0, 0);
 } /*}}}*/
 
-static gchar *normalize_wm_state_name(const char *name) {
+static char *normalize_wm_state_name(const char *name) {
   char *short_names[] = {"modal",          "sticky", "maximized_vert",
                          "maximized_horz", "shaded", "skip_taskbar",
                          "skip_pager",     "hidden", "fullscreen",
@@ -777,18 +866,18 @@ static gchar *normalize_wm_state_name(const char *name) {
   int i;
   for (i = 0; short_names[i]; i++) {
     if (strcmp(short_names[i], name) == 0) {
-      gchar *upcase = g_ascii_strup(name, -1);
-      gchar *result = g_strdup_printf("_NET_WM_STATE_%s", upcase);
-      g_free(upcase);
+      char *upcase = my_ascii_strup(name, -1);
+      char *result = my_strdup_printf("_NET_WM_STATE_%s", upcase);
+      free(upcase);
       return result;
     }
   }
 
   if (strcmp("undecorated", name) == 0) {
-    return g_strdup("_OB_WM_STATE_UNDECORATED");
+    return strdup("_OB_WM_STATE_UNDECORATED");
   }
 
-  return g_strdup(name);
+  return strdup(name);
 }
 
 static int window_state(Display *disp, Window win, const char *arg) { /*{{{*/
@@ -806,7 +895,7 @@ static int window_state(Display *disp, Window win, const char *arg) { /*{{{*/
   }
 
   if ((p1 = strchr(arg, ','))) {
-    gchar *tmp_prop1;
+    char *tmp_prop1;
 
     *p1 = '\0';
 
@@ -825,7 +914,7 @@ static int window_state(Display *disp, Window win, const char *arg) { /*{{{*/
 
     /* the second property */
     if ((p2 = strchr(p1, ','))) {
-      gchar *tmp_prop2;
+      char *tmp_prop2;
 
       *p2 = '\0';
       p2++;
@@ -836,7 +925,7 @@ static int window_state(Display *disp, Window win, const char *arg) { /*{{{*/
       tmp_prop2 = normalize_wm_state_name(p2);
       p_verbose("State 2: %s\n", tmp_prop2);
       prop2 = XInternAtom(disp, tmp_prop2, False);
-      g_free(tmp_prop2);
+      free(tmp_prop2);
     }
 
     /* the first property */
@@ -847,7 +936,7 @@ static int window_state(Display *disp, Window win, const char *arg) { /*{{{*/
     tmp_prop1 = normalize_wm_state_name(p1);
     p_verbose("State 1: %s\n", tmp_prop1);
     prop1 = XInternAtom(disp, tmp_prop1, False);
-    g_free(tmp_prop1);
+    free(tmp_prop1);
 
     return client_msg(disp, win, "_NET_WM_STATE", action, (unsigned long)prop1,
                       (unsigned long)prop2, 0, 0);
@@ -857,7 +946,7 @@ static int window_state(Display *disp, Window win, const char *arg) { /*{{{*/
   }
 } /*}}}*/
 
-static gboolean wm_supports(Display *disp, const gchar *prop) { /*{{{*/
+static bool wm_supports(Display *disp, const char *prop) { /*{{{*/
   Atom xa_prop = XInternAtom(disp, prop, False);
   Atom *list;
   unsigned long size;
@@ -866,18 +955,18 @@ static gboolean wm_supports(Display *disp, const gchar *prop) { /*{{{*/
   if (!(list = (Atom *)get_property(disp, DefaultRootWindow(disp), XA_ATOM,
                                     "_NET_SUPPORTED", &size))) {
     p_verbose("Cannot get _NET_SUPPORTED property.\n");
-    return FALSE;
+    return false;
   }
 
   for (i = 0; i < size / sizeof(Atom); i++) {
     if (list[i] == xa_prop) {
-      g_free(list);
-      return TRUE;
+      free(list);
+      return true;
     }
   }
 
-  g_free(list);
-  return FALSE;
+  free(list);
+  return false;
 } /*}}}*/
 
 static int window_move_resize(Display *disp, Window win,
@@ -938,7 +1027,7 @@ static int action_window(Display *disp, Window win, char mode) { /*{{{*/
   p_verbose("Using window: 0x%.8lx\n", win);
   switch (mode) {
   case 'a':
-    return activate_window(disp, win, TRUE);
+    return activate_window(disp, win, true);
 
   case 'c':
     return close_window(disp, win);
@@ -960,7 +1049,7 @@ static int action_window(Display *disp, Window win, char mode) { /*{{{*/
     if (window_to_desktop(disp, win, -1) == EXIT_SUCCESS) {
       usleep(100000); /* 100 ms - make sure the WM has enough
           time to move the window, before we activate it */
-      return activate_window(disp, win, FALSE);
+      return activate_window(disp, win, false);
     } else {
       return EXIT_FAILURE;
     }
@@ -1017,51 +1106,50 @@ static int action_window_str(Display *disp, char mode) { /*{{{*/
     }
 
     for (i = 0; i < client_list_size / sizeof(Window); i++) {
-      gchar *match_utf8;
+      char *match_utf8;
       if (options.show_class) {
         match_utf8 = get_window_class(disp, client_list[i]); /* UTF8 */
       } else {
         match_utf8 = get_window_title(disp, client_list[i]); /* UTF8 */
       }
       if (match_utf8) {
-        gchar *match;
-        gchar *match_cf;
-        gchar *match_utf8_cf = NULL;
+        char *match;
+        char *match_cf;
+        char *match_utf8_cf = NULL;
         if (envir_utf8) {
-          match = g_strdup(options.param_window);
-          match_cf = g_utf8_casefold(options.param_window, -1);
+          match = strdup(options.param_window);
+          match_cf = my_utf8_casefold(options.param_window, -1);
         } else {
-          if (!(match = g_locale_to_utf8(options.param_window, -1, NULL, NULL,
-                                         NULL))) {
-            match = g_strdup(options.param_window);
+          if (!(match = my_locale_to_utf8(options.param_window))) {
+            match = strdup(options.param_window);
           }
-          match_cf = g_utf8_casefold(match, -1);
+          match_cf = my_utf8_casefold(match, -1);
         }
 
         if (!match || !match_cf) {
           continue;
         }
 
-        match_utf8_cf = g_utf8_casefold(match_utf8, -1);
+        match_utf8_cf = my_utf8_casefold(match_utf8, -1);
 
         if ((options.full_window_title_match &&
              strcmp(match_utf8, match) == 0) ||
             (!options.full_window_title_match &&
              strstr(match_utf8_cf, match_cf))) {
           activate = client_list[i];
-          g_free(match);
-          g_free(match_cf);
-          g_free(match_utf8);
-          g_free(match_utf8_cf);
+          free(match);
+          free(match_cf);
+          free(match_utf8);
+          free(match_utf8_cf);
           break;
         }
-        g_free(match);
-        g_free(match_cf);
-        g_free(match_utf8);
-        g_free(match_utf8_cf);
+        free(match);
+        free(match_cf);
+        free(match_utf8);
+        free(match_utf8_cf);
       }
     }
-    g_free(client_list);
+    free(client_list);
 
     if (activate) {
       return action_window(disp, activate, mode);
@@ -1077,20 +1165,20 @@ static int list_desktops(Display *disp) { /*{{{*/
   unsigned long desktop_list_size = 0;
   unsigned long *desktop_geometry = NULL;
   unsigned long desktop_geometry_size = 0;
-  gchar **desktop_geometry_str = NULL;
+  char **desktop_geometry_str = NULL;
   unsigned long *desktop_viewport = NULL;
   unsigned long desktop_viewport_size = 0;
-  gchar **desktop_viewport_str = NULL;
+  char **desktop_viewport_str = NULL;
   unsigned long *desktop_workarea = NULL;
   unsigned long desktop_workarea_size = 0;
-  gchar **desktop_workarea_str = NULL;
-  gchar *list = NULL;
+  char **desktop_workarea_str = NULL;
+  char *list = NULL;
   int i;
   int id;
   Window root = DefaultRootWindow(disp);
   int ret = EXIT_FAILURE;
-  gchar **names = NULL;
-  gboolean names_are_utf8 = TRUE;
+  char **names = NULL;
+  bool names_are_utf8 = true;
 
   if (!(num_desktops = (unsigned long *)get_property(
             disp, root, XA_CARDINAL, "_NET_NUMBER_OF_DESKTOPS", NULL))) {
@@ -1119,7 +1207,7 @@ static int list_desktops(Display *disp) { /*{{{*/
   if (options.wa_desktop_titles_invalid_utf8 ||
       (list = get_property(disp, root, XInternAtom(disp, "UTF8_STRING", False),
                            "_NET_DESKTOP_NAMES", &desktop_list_size)) == NULL) {
-    names_are_utf8 = FALSE;
+    names_are_utf8 = false;
     if ((list = get_property(disp, root, XA_STRING, "_WIN_WORKSPACE_NAMES",
                              &desktop_list_size)) == NULL) {
       p_verbose("Cannot get desktop names properties. "
@@ -1157,7 +1245,7 @@ static int list_desktops(Display *disp) { /*{{{*/
   }
 
   /* prepare the array of desktop names */
-  names = g_malloc0(*num_desktops * sizeof(char *));
+  names = calloc(1, *num_desktops * sizeof(char *));
   if (list) {
     id = 0;
     names[id++] = list;
@@ -1172,14 +1260,14 @@ static int list_desktops(Display *disp) { /*{{{*/
   }
 
   /* prepare desktop geometry strings */
-  desktop_geometry_str = g_malloc0((*num_desktops + 1) * sizeof(char *));
+  desktop_geometry_str = calloc(1, (*num_desktops + 1) * sizeof(char *));
   if (desktop_geometry && desktop_geometry_size > 0) {
     if (desktop_geometry_size == 2 * sizeof(*desktop_geometry)) {
       /* only one value - use it for all desktops */
       p_verbose(
           "WM provides _NET_DESKTOP_GEOMETRY value common for all desktops.\n");
       for (i = 0; i < *num_desktops; i++) {
-        desktop_geometry_str[i] = g_strdup_printf(
+        desktop_geometry_str[i] = my_strdup_printf(
             "%lux%lu", desktop_geometry[0], desktop_geometry[1]);
       }
     } else {
@@ -1188,21 +1276,21 @@ static int list_desktops(Display *disp) { /*{{{*/
                 "desktop.\n");
       for (i = 0; i < *num_desktops; i++) {
         if (i < desktop_geometry_size / sizeof(*desktop_geometry) / 2) {
-          desktop_geometry_str[i] = g_strdup_printf(
+          desktop_geometry_str[i] = my_strdup_printf(
               "%lux%lu", desktop_geometry[i * 2], desktop_geometry[i * 2 + 1]);
         } else {
-          desktop_geometry_str[i] = g_strdup("N/A");
+          desktop_geometry_str[i] = strdup("N/A");
         }
       }
     }
   } else {
     for (i = 0; i < *num_desktops; i++) {
-      desktop_geometry_str[i] = g_strdup("N/A");
+      desktop_geometry_str[i] = strdup("N/A");
     }
   }
 
   /* prepare desktop viewport strings */
-  desktop_viewport_str = g_malloc0((*num_desktops + 1) * sizeof(char *));
+  desktop_viewport_str = calloc(1, (*num_desktops + 1) * sizeof(char *));
   if (desktop_viewport && desktop_viewport_size > 0) {
     if (desktop_viewport_size == 2 * sizeof(*desktop_viewport)) {
       /* only one value - use it for current desktop */
@@ -1210,31 +1298,31 @@ static int list_desktops(Display *disp) { /*{{{*/
                 "desktop.\n");
       for (i = 0; i < *num_desktops; i++) {
         if (i == *cur_desktop) {
-          desktop_viewport_str[i] = g_strdup_printf(
+          desktop_viewport_str[i] = my_strdup_printf(
               "%lu,%lu", desktop_viewport[0], desktop_viewport[1]);
         } else {
-          desktop_viewport_str[i] = g_strdup("N/A");
+          desktop_viewport_str[i] = strdup("N/A");
         }
       }
     } else {
       /* seperate values for each of desktops */
       for (i = 0; i < *num_desktops; i++) {
         if (i < desktop_viewport_size / sizeof(*desktop_viewport) / 2) {
-          desktop_viewport_str[i] = g_strdup_printf(
+          desktop_viewport_str[i] = my_strdup_printf(
               "%lu,%lu", desktop_viewport[i * 2], desktop_viewport[i * 2 + 1]);
         } else {
-          desktop_viewport_str[i] = g_strdup("N/A");
+          desktop_viewport_str[i] = strdup("N/A");
         }
       }
     }
   } else {
     for (i = 0; i < *num_desktops; i++) {
-      desktop_viewport_str[i] = g_strdup("N/A");
+      desktop_viewport_str[i] = strdup("N/A");
     }
   }
 
   /* prepare desktop workarea strings */
-  desktop_workarea_str = g_malloc0((*num_desktops + 1) * sizeof(char *));
+  desktop_workarea_str = calloc(1, (*num_desktops + 1) * sizeof(char *));
   if (desktop_workarea && desktop_workarea_size > 0) {
     if (desktop_workarea_size == 4 * sizeof(*desktop_workarea)) {
       /* only one value - use it for current desktop */
@@ -1242,41 +1330,41 @@ static int list_desktops(Display *disp) { /*{{{*/
           "WM provides _NET_WORKAREA value only for the current desktop.\n");
       for (i = 0; i < *num_desktops; i++) {
         if (i == *cur_desktop) {
-          desktop_workarea_str[i] = g_strdup_printf(
+          desktop_workarea_str[i] = my_strdup_printf(
               "%lu,%lu %lux%lu", desktop_workarea[0], desktop_workarea[1],
               desktop_workarea[2], desktop_workarea[3]);
         } else {
-          desktop_workarea_str[i] = g_strdup("N/A");
+          desktop_workarea_str[i] = strdup("N/A");
         }
       }
     } else {
       /* seperate values for each of desktops */
       for (i = 0; i < *num_desktops; i++) {
         if (i < desktop_workarea_size / sizeof(*desktop_workarea) / 4) {
-          desktop_workarea_str[i] = g_strdup_printf(
+          desktop_workarea_str[i] = my_strdup_printf(
               "%lu,%lu %lux%lu", desktop_workarea[i * 4],
               desktop_workarea[i * 4 + 1], desktop_workarea[i * 4 + 2],
               desktop_workarea[i * 4 + 3]);
         } else {
-          desktop_workarea_str[i] = g_strdup("N/A");
+          desktop_workarea_str[i] = strdup("N/A");
         }
       }
     }
   } else {
     for (i = 0; i < *num_desktops; i++) {
-      desktop_workarea_str[i] = g_strdup("N/A");
+      desktop_workarea_str[i] = strdup("N/A");
     }
   }
 
   /* print the list */
   for (i = 0; i < *num_desktops; i++) {
-    gchar *out = get_output_str(names[i], names_are_utf8);
+    char *out = get_output_str(names[i], names_are_utf8);
     printf("%-2d %c DG: %-*s  VP: %-*s  WA: %-*s  %s\n", i,
            i == *cur_desktop ? '*' : '-', longest_str(desktop_geometry_str),
            desktop_geometry_str[i], longest_str(desktop_viewport_str),
            desktop_viewport_str[i], longest_str(desktop_workarea_str),
            desktop_workarea_str[i], out ? out : "N/A");
-    g_free(out);
+    free(out);
   }
 
   p_verbose("Total number of desktops: %lu\n", *num_desktops);
@@ -1286,21 +1374,21 @@ static int list_desktops(Display *disp) { /*{{{*/
   goto cleanup;
 
 cleanup:
-  g_free(names);
-  g_free(num_desktops);
-  g_free(cur_desktop);
-  g_free(desktop_geometry);
-  g_strfreev(desktop_geometry_str);
-  g_free(desktop_viewport);
-  g_strfreev(desktop_viewport_str);
-  g_free(desktop_workarea);
-  g_strfreev(desktop_workarea_str);
-  g_free(list);
+  free(names);
+  free(num_desktops);
+  free(cur_desktop);
+  free(desktop_geometry);
+  my_strfreev(desktop_geometry_str);
+  free(desktop_viewport);
+  my_strfreev(desktop_viewport_str);
+  free(desktop_workarea);
+  my_strfreev(desktop_workarea_str);
+  free(list);
 
   return ret;
 } /*}}}*/
 
-static int longest_str(gchar **strv) { /*{{{*/
+static int longest_str(char **strv) { /*{{{*/
   int max = 0;
   int i = 0;
 
@@ -1346,20 +1434,20 @@ static int list_windows(Display *disp) { /*{{{*/
 
   /* find the longest client_machine name */
   for (i = 0; i < client_list_size / sizeof(Window); i++) {
-    gchar *client_machine;
+    char *client_machine;
     if ((client_machine = get_property(disp, client_list[i], XA_STRING,
                                        "WM_CLIENT_MACHINE", NULL))) {
       max_client_machine_len = strlen(client_machine);
     }
-    g_free(client_machine);
+    free(client_machine);
   }
 
   /* print the list */
   for (i = 0; i < client_list_size / sizeof(Window); i++) {
-    gchar *title_utf8 = get_window_title(disp, client_list[i]); /* UTF8 */
-    gchar *title_out = get_output_str(title_utf8, TRUE);
-    gchar *client_machine;
-    gchar *class_out = get_window_class(disp, client_list[i]); /* UTF8 */
+    char *title_utf8 = get_window_title(disp, client_list[i]); /* UTF8 */
+    char *title_out = get_output_str(title_utf8, true);
+    char *client_machine;
+    char *class_out = get_window_class(disp, client_list[i]); /* UTF8 */
     unsigned long *pid;
     unsigned long *desktop;
     int x, y, junkx, junky;
@@ -1404,66 +1492,66 @@ static int list_windows(Display *disp) { /*{{{*/
     printf(" %*s %s\n", max_client_machine_len,
            client_machine ? client_machine : "N/A",
            title_out ? title_out : "N/A");
-    g_free(title_utf8);
-    g_free(title_out);
-    g_free(desktop);
-    g_free(client_machine);
-    g_free(class_out);
-    g_free(pid);
+    free(title_utf8);
+    free(title_out);
+    free(desktop);
+    free(client_machine);
+    free(class_out);
+    free(pid);
   }
-  g_free(client_list);
+  free(client_list);
 
   return EXIT_SUCCESS;
 } /*}}}*/
 
-static gchar *get_window_class(Display *disp, Window win) { /*{{{*/
-  gchar *class_utf8;
-  gchar *wm_class;
+static char *get_window_class(Display *disp, Window win) { /*{{{*/
+  char *class_utf8;
+  char *wm_class;
   unsigned long size;
 
   wm_class = get_property(disp, win, XA_STRING, "WM_CLASS", &size);
   if (wm_class) {
-    gchar *p_0 = strchr(wm_class, '\0');
+    char *p_0 = strchr(wm_class, '\0');
     if (wm_class + size - 1 > p_0) {
       *(p_0) = '.';
     }
-    class_utf8 = g_locale_to_utf8(wm_class, -1, NULL, NULL, NULL);
+    class_utf8 = my_locale_to_utf8(wm_class);
   } else {
     class_utf8 = NULL;
   }
 
-  g_free(wm_class);
+  free(wm_class);
 
   return class_utf8;
 } /*}}}*/
 
-static gchar *get_window_title(Display *disp, Window win) { /*{{{*/
-  gchar *title_utf8;
-  gchar *wm_name;
-  gchar *net_wm_name;
+static char *get_window_title(Display *disp, Window win) { /*{{{*/
+  char *title_utf8;
+  char *wm_name;
+  char *net_wm_name;
 
   wm_name = get_property(disp, win, XA_STRING, "WM_NAME", NULL);
   net_wm_name = get_property(disp, win, XInternAtom(disp, "UTF8_STRING", False),
                              "_NET_WM_NAME", NULL);
 
   if (net_wm_name) {
-    title_utf8 = g_strdup(net_wm_name);
+    title_utf8 = strdup(net_wm_name);
   } else {
     if (wm_name) {
-      title_utf8 = g_locale_to_utf8(wm_name, -1, NULL, NULL, NULL);
+      title_utf8 = my_locale_to_utf8(wm_name);
     } else {
       title_utf8 = NULL;
     }
   }
 
-  g_free(wm_name);
-  g_free(net_wm_name);
+  free(wm_name);
+  free(net_wm_name);
 
   return title_utf8;
 } /*}}}*/
 
-static gchar *get_property(Display *disp, Window win, /*{{{*/
-                           Atom xa_prop_type, gchar *prop_name,
+static char *get_property(Display *disp, Window win, /*{{{*/
+                           Atom xa_prop_type, char *prop_name,
                            unsigned long *size) {
   Atom xa_prop_name;
   Atom xa_ret_type;
@@ -1472,7 +1560,7 @@ static gchar *get_property(Display *disp, Window win, /*{{{*/
   unsigned long ret_bytes_after;
   unsigned long tmp_size;
   unsigned char *ret_prop;
-  gchar *ret;
+  char *ret;
 
   xa_prop_name = XInternAtom(disp, prop_name, False);
 
@@ -1496,7 +1584,7 @@ static gchar *get_property(Display *disp, Window win, /*{{{*/
 
   /* null terminate the result to make string handling easier */
   tmp_size = (ret_format / (32 / sizeof(long))) * ret_nitems;
-  ret = g_malloc(tmp_size + 1);
+  ret = malloc(tmp_size + 1);
   memcpy(ret, ret_prop, tmp_size);
   ret[tmp_size] = '\0';
 
@@ -1574,7 +1662,7 @@ static Window get_active_window(Display *disp) { /*{{{*/
                       "_NET_ACTIVE_WINDOW", &size);
   if (prop) {
     ret = *((Window *)prop);
-    g_free(prop);
+    free(prop);
   }
 
   return (ret);
