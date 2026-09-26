@@ -24,11 +24,14 @@ Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 */
 /* }}} */
 
+#include "config.h"
+
+#define _GNU_SOURCE
+
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <X11/Xmu/WinUtil.h>
 #include <X11/cursorfont.h>
-#define _GNU_SOURCE
 #include <locale.h>
 #include <stdio.h>
 #include <stdlib.h>

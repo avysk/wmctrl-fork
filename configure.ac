@@ -1,5 +1,6 @@
 AC_INIT([wmctrl-fork], 1.09.03)
 AC_CONFIG_SRCDIR([main.c])
+AC_CONFIG_HEADERS([config.h])
 AM_INIT_AUTOMAKE
 AC_PROG_CC
 AC_PATH_XTRA
