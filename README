@@ -5,8 +5,13 @@ This repository is originally forked from https://github.com/Conservatory/wmctrl
 wmctrl
 A command line tool to interact with an EWMH/NetWM compatible X Window Manager.
 
+This branch removes the GLib dependency. Prerequisites: a C compiler, X11
+(headers and libraries, including Xmu), libutf8proc, iconv (libiconv on
+FreeBSD), plus autoconf/automake if building from a git checkout.
+
 To compile and install the program, run the following commands:
 
+    autoreconf -i    (only when building from a git checkout)
     ./configure
     make
     (become root)
